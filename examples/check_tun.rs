@@ -12,9 +12,15 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// MTU (Maximum Transmission Unit)
+    /// MTU (Maximum Transmission Unit) for the TUN device.
+    /// Use 65535 for GSO/GRO support.
     #[arg(long, default_value_t = 1280)]
     mtu: usize,
+
+    /// Egress MTU (Physical Network Limit).
+    /// Used for TCP MSS clamping and UDP packet size limits.
+    #[arg(long, default_value_t = 1280)]
+    egress_mtu: usize,
 
     /// Handshake Mode: fast (0-RTT) or consistent (Real RTT)
     #[arg(long, default_value = "fast")]
@@ -35,7 +41,7 @@ async fn main() -> io::Result<()> {
 
     println!("🚀 Prism Echo Server Benchmark");
     println!("Operating System: {}", std::env::consts::OS);
-    println!("Configuration: MTU={}, Mode={:?}", args.mtu, handshake_mode);
+    println!("Configuration: TUN MTU={}, Egress MTU={}, Mode={:?}", args.mtu, args.egress_mtu, handshake_mode);
     
     // 1. Create TUN Device
     // User requested 10.11.12.1 to avoid 10.0.0.1 conflict
