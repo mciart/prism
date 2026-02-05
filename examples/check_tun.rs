@@ -31,8 +31,8 @@ async fn main() -> io::Result<()> {
         .packet_information(false); // Critical for macOS to avoid 4-byte header
 
     let dev = builder.build_async().expect("Failed to create TUN");
+    println!("✅ TUN Device Created: {} (IP: 10.11.12.1, IPv6: fd00::1)", dev.name().unwrap_or("unknown".to_string()));
     let dev = Arc::new(dev); // Wrap in Arc for shared access
-    println!("✅ TUN Device Created (IP: 10.11.12.1, IPv6: fd00::1)");
     
     // 2. Setup Prism Channels (TUN <-> Stack)
     let (tun_tx, mut tun_rx) = mpsc::channel::<Bytes>(8192); // Stack -> OS
