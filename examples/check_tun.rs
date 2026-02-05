@@ -116,6 +116,7 @@ async fn main() -> io::Result<()> {
     // 3. Create Prism Stack
     let config = PrismConfig {
         handshake_mode,
+        egress_mtu: args.mtu, // Pass explicitly
     };
     
     let device = PrismDevice::new(os_rx, tun_tx.clone(), args.mtu, Medium::Ip);

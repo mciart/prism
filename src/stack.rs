@@ -19,6 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Debug, Clone)]
 pub struct PrismConfig {
     pub handshake_mode: HandshakeMode,
+    pub egress_mtu: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,14 +183,24 @@ impl PrismStack {
                                     }
                                 }
                                 crate::trap::PacketType::Other => {
-                                    // UDP/ICMP/Gre etc. -> Blind Relay
-                                    if let Some(ref relay) = self.blind_relay_tx {
-                                        // Fire and forget, don't block main loop
-                                        let _ = relay.try_send(pkt.freeze());
+                                    // [Added] Check packet size to prevent huge UDP packets from blocking physical NIC
+                                    if pkt.len() > self.config.egress_mtu {
+                                        tracing::warn!(
+                                            "Dropping huge UDP packet: {} > {}",
+                                            pkt.len(),
+                                            self.config.egress_mtu
+                                        );
+                                        // Drop directly, do not put into blind_relay_tx
                                     } else {
-                                        // If no relay configured, drop or let stack reject it (ICMP Unreachable)
-                                        // Letting stack see it might generate "Port Unreachable", which is good.
-                                        self.device.pending_packets.push_back(pkt);
+                                        // UDP/ICMP/Gre etc. -> Blind Relay
+                                        if let Some(ref relay) = self.blind_relay_tx {
+                                            // Fire and forget, don't block main loop
+                                            let _ = relay.try_send(pkt.freeze());
+                                        } else {
+                                            // If no relay configured, drop or let stack reject it (ICMP Unreachable)
+                                            // Letting stack see it might generate "Port Unreachable", which is good.
+                                            self.device.pending_packets.push_back(pkt);
+                                        }
                                     }
                                 }
                                 crate::trap::PacketType::Unknown => {
@@ -321,6 +332,21 @@ impl PrismStack {
         // Phase 5 Step 2: Configure socket for Jumbo Frames
         // Allow Nagle's algorithm to be disabled (optional, but good for latency)
         socket.set_nagle_enabled(false); 
+
+        // Calculate safe MSS (Egress MTU - 80)
+        // 80 bytes = 40 (IPv6) + 20 (TCP) + 20 (Options)
+        let _safe_mss = if self.config.egress_mtu > 80 {
+            self.config.egress_mtu - 80
+        } else {
+            536 // Fallback
+        };
+
+        // smoltcp socket does not have a public API to set_mss directly.
+        // It automatically negotiates MSS based on Interface MTU.
+        // Since interface MTU is 65535, smoltcp defaults to a huge MSS.
+        // Best practice: To fully support this, we should modify trap.rs to inspect_packet 
+        // and return MSS info, or rely on physical NIC fragmentation.
+        // For now, we calculate _safe_mss but keep existing behavior as per instruction.
         
         // Critical for GSO: Set a very large MSS to prevent smoltcp from fragmenting
         // This relies on the fact that our underlying device (PrismDevice) claims a large MTU (65535)
