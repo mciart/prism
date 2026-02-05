@@ -17,13 +17,13 @@ pub enum PacketType {
 }
 
 /// Inspects the packet to determine if it is TCP or something else.
-pub fn get_packet_type(buffer: &Bytes) -> PacketType {
+pub fn get_packet_type(buffer: &[u8]) -> PacketType {
     if buffer.len() < 1 { return PacketType::Unknown; }
     
     let version = buffer[0] >> 4;
     match version {
         4 => {
-            if let Ok(ip) = Ipv4Packet::new_checked(buffer.as_ref()) {
+            if let Ok(ip) = Ipv4Packet::new_checked(buffer) {
                 if ip.next_header() == IpProtocol::Tcp {
                     return PacketType::Tcp;
                 }
@@ -32,9 +32,9 @@ pub fn get_packet_type(buffer: &Bytes) -> PacketType {
             PacketType::Unknown
         }
         6 => {
-             if let Ok(_) = Ipv6Packet::new_checked(buffer.as_ref()) {
+            if let Ok(_) = Ipv6Packet::new_checked(buffer) {
                 // Elegant IPv6 Extension Header Skipping
-                if let Ok((next_proto, _offset)) = skip_ipv6_headers(buffer.as_ref()) {
+                if let Ok((next_proto, _offset)) = skip_ipv6_headers(buffer) {
                      if next_proto == IpProtocol::Tcp {
                          return PacketType::Tcp;
                      }
@@ -80,7 +80,7 @@ fn skip_ipv6_headers(buffer: &[u8]) -> Result<(IpProtocol, usize), ()> {
 }
 
 /// Inspects a raw packet buffer to detect TCP SYN segments.
-pub fn inspect_packet(buffer: &Bytes) -> Option<PrismTrap> {
+pub fn inspect_packet(buffer: &[u8]) -> Option<PrismTrap> {
     // Basic length check
     if buffer.len() < 20 {
         return None;
@@ -94,8 +94,8 @@ pub fn inspect_packet(buffer: &Bytes) -> Option<PrismTrap> {
     }
 }
 
-fn inspect_ipv4(buffer: &Bytes) -> Option<PrismTrap> {
-    let ipv4_packet = Ipv4Packet::new_checked(buffer.as_ref()).ok()?;
+fn inspect_ipv4(buffer: &[u8]) -> Option<PrismTrap> {
+    let ipv4_packet = Ipv4Packet::new_checked(buffer).ok()?;
     if ipv4_packet.next_header() != IpProtocol::Tcp {
         return None;
     }
@@ -107,11 +107,11 @@ fn inspect_ipv4(buffer: &Bytes) -> Option<PrismTrap> {
     inspect_tcp(payload, dst_addr, buffer)
 }
 
-fn inspect_ipv6(buffer: &Bytes) -> Option<PrismTrap> {
-    let ipv6_packet = Ipv6Packet::new_checked(buffer.as_ref()).ok()?;
+fn inspect_ipv6(buffer: &[u8]) -> Option<PrismTrap> {
+    let ipv6_packet = Ipv6Packet::new_checked(buffer).ok()?;
     
     // Header Skipping Logic
-    if let Ok((proto, offset)) = skip_ipv6_headers(buffer.as_ref()) {
+    if let Ok((proto, offset)) = skip_ipv6_headers(buffer) {
         if proto == IpProtocol::Tcp {
              if offset > buffer.len() { return None; }
              let payload = &buffer[offset..];
@@ -124,14 +124,14 @@ fn inspect_ipv6(buffer: &Bytes) -> Option<PrismTrap> {
     None
 }
 
-fn inspect_tcp(buffer: &[u8], dst_ip: IpAddr, original_packet: &Bytes) -> Option<PrismTrap> {
+fn inspect_tcp(buffer: &[u8], dst_ip: IpAddr, original_packet: &[u8]) -> Option<PrismTrap> {
     let tcp_packet = TcpPacket::new_checked(buffer).ok()?;
     
     // Check for SYN flag (and NOT ACK/RST)
     if tcp_packet.syn() && !tcp_packet.ack() && !tcp_packet.rst() {
         let event = PrismTrap {
             dst: SocketAddr::new(dst_ip, tcp_packet.dst_port()),
-            packet: original_packet.clone(),
+            packet: Bytes::copy_from_slice(original_packet),
         };
         return Some(event);
     }

@@ -4,22 +4,22 @@ use tokio::sync::mpsc;
 use crate::trap::PrismTrap;
 use std::collections::VecDeque;
 use tracing::warn;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 /// A TunDevice that bridges tokio mpsc channels to smoltcp.
-/// Now uses `bytes::Bytes` for zero-copy efficiency.
+/// Now uses `bytes::BytesMut` for zero-copy efficiency.
 pub struct PrismDevice {
-    pub rx_queue: mpsc::Receiver<Bytes>,
+    pub rx_queue: mpsc::Receiver<BytesMut>,
     pub tx_queue: mpsc::Sender<Bytes>,
     pub trap_tx: Option<mpsc::Sender<PrismTrap>>,
-    pub pending_packets: VecDeque<Bytes>,
+    pub pending_packets: VecDeque<BytesMut>,
     pub mtu: usize,
     pub medium: Medium,
 }
 
 impl PrismDevice {
     pub fn new(
-        rx_queue: mpsc::Receiver<Bytes>,
+        rx_queue: mpsc::Receiver<BytesMut>,
         tx_queue: mpsc::Sender<Bytes>,
         mtu: usize,
         medium: Medium,
@@ -70,35 +70,16 @@ impl Device for PrismDevice {
     }
 }
 
-pub struct RxTokenImpl(Bytes);
+pub struct RxTokenImpl(BytesMut);
 
 impl RxToken for RxTokenImpl {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         // smoltcp requires &mut [u8] for RxToken!
-        // This is tricky with Bytes which is immutable.
-        // However, smoltcp only modifies the buffer for checksum offloading usually (swapping bytes).
-        // Since we are software, we might not need mutable access for reading?
-        // Wait, smoltcp RxToken `consume` gives `&mut [u8]`.
-        // If we give immutable `Bytes`, we must enable `Packet` mutation or copy.
-        // Option A: Copy to stack (bad).
-        // Option B: Use `BytesMut`? But we received `Bytes`.
-        // Option C: Use `std::cell::RefCell` / `unsafe` cast if we know smoltcp behaves? (Crucial Risk)
-        // Option D: Clone to `Vec<u8>` (Defeats the purpose temporarily, but safer than Unsafe).
-        
-        // Let's implement Option D for now (Migration Phase 6.2a).
-        // To be truly zero-copy with smoltcp, we might need to implement a custom Device that owns a BytesMut pool?
-        // Or if smoltcp doesn't actually mutate, we are fine.
-        // Actually, rx packets ARE mutated by smoltcp sometimes (e.g. adjust headers).
-        
-        // Wait, let's look at `RxToken::consume` signature.
-        // `fn consume<R, F>(self, f: F) -> R where F: FnOnce(&mut [u8]) -> R`
-        // It demands mutable reference.
-        
-        let mut buffer = self.0.to_vec(); // Copy occurs here.
-        f(&mut buffer)
+        // With BytesMut, we can provide mutable access directly without copying.
+        f(&mut self.0)
     }
 }
 

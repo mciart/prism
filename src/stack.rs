@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, warn, error};
 use smoltcp::phy::Device;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{StreamExt, SelectAll, BoxStream};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -185,7 +185,7 @@ impl PrismStack {
                                     // UDP/ICMP/Gre etc. -> Blind Relay
                                     if let Some(ref relay) = self.blind_relay_tx {
                                         // Fire and forget, don't block main loop
-                                        let _ = relay.try_send(pkt);
+                                        let _ = relay.try_send(pkt.freeze());
                                     } else {
                                         // If no relay configured, drop or let stack reject it (ICMP Unreachable)
                                         // Letting stack see it might generate "Port Unreachable", which is good.
@@ -309,7 +309,7 @@ impl PrismStack {
     }
 
     // Helper to handle Trap Logic
-    fn handle_trap(&mut self, event: crate::trap::TrapEvent, pkt: Bytes, rx_buf_size: usize, tx_buf_size: usize) {
+    fn handle_trap(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, rx_buf_size: usize, tx_buf_size: usize) {
         debug!("Trapped SYN for target: {}", event.dst);
         
         let mut socket = tcp::Socket::new(
@@ -356,7 +356,7 @@ impl PrismStack {
         }
     }
 
-    fn initiate_consistent_handshake(&mut self, event: crate::trap::TrapEvent, pkt: Bytes) {
+    fn initiate_consistent_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut) {
         debug!("Consistent Handshake: Buffering SYN for {}", event.dst);
         
         if let Some(ref req_tx) = self.tunnel_req_tx {
@@ -374,7 +374,7 @@ impl PrismStack {
             if let Err(e) = req_tx.try_send(request) {
                 error!("Failed to request tunnel (Consistent): {}", e);
             } else {
-                 let trap = PrismTrap { dst: event.dst, packet: pkt };
+                 let trap = PrismTrap { dst: event.dst, packet: pkt.freeze() };
                  // Store pending
                  self.pending_syns.insert(event.dst, (trap, tx_to_remote, rx_from_remote));
                  
@@ -389,7 +389,7 @@ impl PrismStack {
         }
     }
 
-    fn initiate_fast_handshake(&mut self, event: crate::trap::TrapEvent, pkt: Bytes, mut socket: tcp::Socket<'static>) {
+    fn initiate_fast_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, mut socket: tcp::Socket<'static>) {
     // Unconditional handling - smoltcp IpEndpoint handles both V4/V6 via IpAddress enum
     // But we need to convert std::net::SocketAddr to smoltcp::wire::IpEndpoint
     let endpoint = match event.dst {
@@ -463,7 +463,7 @@ impl PrismStack {
                     self.ingress_streams.push(
                         ReceiverStream::new(rx_from_remote).map(move |b| (handle, b)).boxed()
                     );
-                    self.device.pending_packets.push_back(trap.packet);
+                    self.device.pending_packets.push_back(BytesMut::from(trap.packet.as_ref()));
                 }
             } else {
                 warn!("Tunnel failed for {}. Dropping SYN.", target);

@@ -2,7 +2,7 @@ use tun_rs::DeviceBuilder;
 use std::io;
 use smoltcp::phy::Medium;
 use tokio::sync::mpsc;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use prism::stack::{PrismStack, PrismConfig, HandshakeMode};
 use prism::device::PrismDevice;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ async fn main() -> io::Result<()> {
             std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
             64
         )
-        .mtu(1500) // Standard MTU
+        .mtu(1280) // Conservative MTU for mobile networks
         .packet_information(false); // Critical for macOS to avoid 4-byte header
 
     let dev = builder.build_async().expect("Failed to create TUN");
@@ -36,20 +36,22 @@ async fn main() -> io::Result<()> {
     
     // 2. Setup Prism Channels (TUN <-> Stack)
     let (tun_tx, mut tun_rx) = mpsc::channel::<Bytes>(8192); // Stack -> OS
-    let (os_tx, os_rx) = mpsc::channel::<Bytes>(8192); // OS -> Stack
+    let (os_tx, os_rx) = mpsc::channel::<BytesMut>(8192); // OS -> Stack (BytesMut for Zero-Copy)
 
     // Spawn Bridge Tasks
     // Reader Task
     let reader_dev = dev.clone();
     tokio::spawn(async move {
-        let mut buf = [0u8; 2048];
         loop {
+            // Pre-allocate buffer on heap (Zero-Copy-ish: write directly to heap buffer)
+            let mut buf = BytesMut::zeroed(2048); 
+            
             // tun-rs AsyncDevice implements AsyncRead
             match reader_dev.recv(&mut buf).await {
                 Ok(n) => {
                     if n > 0 {
-                         let data = Bytes::copy_from_slice(&buf[..n]);
-                         if os_tx.send(data).await.is_err() { break; }
+                         buf.truncate(n);
+                         if os_tx.send(buf).await.is_err() { break; }
                     }
                 }
                 Err(e) => {
@@ -76,7 +78,7 @@ async fn main() -> io::Result<()> {
         handshake_mode: HandshakeMode::Fast,
     };
     
-    let device = PrismDevice::new(os_rx, tun_tx.clone(), 1500, Medium::Ip);
+    let device = PrismDevice::new(os_rx, tun_tx.clone(), 1280, Medium::Ip);
     let mut stack = PrismStack::new(device, config);
     
     // 4. Setup Tunnel Request Handling AND Blind Relay

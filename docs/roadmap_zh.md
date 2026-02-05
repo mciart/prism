@@ -80,20 +80,20 @@
 
 ```mermaid
 graph TD
-    UserApp[用户应用 (Browser/Game)] -->|Syscall| OS_Network[操作系统网络栈]
-    OS_Network -->|IP Packet| TUN_Interface[TUN/TAP 网卡]
+    UserApp["用户应用 (Browser/Game)"] -->|Syscall| OS_Network["操作系统网络栈"]
+    OS_Network -->|IP Packet| TUN_Interface["TUN/TAP 网卡"]
     
     subgraph "Mirage/Prism User Space"
         TUN_Interface <-->|Read/Write| PrismDevice
         
         subgraph "Prism Core"
-            PrismDevice <-->|Bytes| PrismStack[Prism 虚拟协议栈 (smoltcp)]
-            PrismStack -- "Intercept SYN" --> PrismTrap[AnyIP 拦截器]
-            PrismStack -- "TCP Stream" --> VirtualSocket[Virtual TCP Socket]
+            PrismDevice <-->|Bytes| PrismStack["Prism 虚拟协议栈 (smoltcp)"]
+            PrismStack -- "Intercept SYN" --> PrismTrap["AnyIP 拦截器"]
+            PrismStack -- "TCP Stream" --> VirtualSocket["Virtual TCP Socket"]
         end
         
-        VirtualSocket <-->|Bytes| ClientRelayer[Client Relayer]
-        ClientRelayer <-->|TLS/Stream| RemoteServer[远端服务器]
+        VirtualSocket <-->|Bytes| ClientRelayer["Client Relayer"]
+        ClientRelayer <-->|TLS/Stream| RemoteServer["远端服务器"]
     end
 ```
 
