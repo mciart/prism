@@ -91,9 +91,11 @@ impl<'a> TxToken for TxTokenImpl<'a> {
         F: FnOnce(&mut [u8]) -> R,
     {
         // Optimization: Use BytesMut to avoid Vec allocation (malloc)
-        // We use zeroed() to ensure safety (initialized memory), although it has slight overhead.
-        // This allows us to freeze() into Bytes without copying.
-        let mut buffer = BytesMut::zeroed(len);
+        // We use with_capacity + unsafe set_len to avoid memset(0) overhead.
+        // This is safe because f() is expected to initialize the buffer (smoltcp writes to it).
+        let mut buffer = BytesMut::with_capacity(len);
+        unsafe { buffer.set_len(len) };
+        
         let result = f(&mut buffer);
         let bytes = buffer.freeze();
         

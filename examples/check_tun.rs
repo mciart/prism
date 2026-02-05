@@ -64,17 +64,34 @@ async fn main() -> io::Result<()> {
     // Reader Task
     let reader_dev = dev.clone();
     tokio::spawn(async move {
+        // Optimization A: Buffer Reuse (Smart Batching)
+        // Allocate a large buffer (1MB) once to reduce malloc overhead
+        let mut buf = BytesMut::with_capacity(1024 * 1024);
+        
         loop {
-            // Pre-allocate buffer on heap (Zero-Copy-ish: write directly to heap buffer)
-            // Phase 5 Step 1: Increase buffer to 65535 to support Jumbo Frames
-            let mut buf = BytesMut::zeroed(65535); 
+            // Ensure capacity for next Jumbo Frame
+            if buf.capacity() < 65535 {
+                buf.reserve(65535);
+            }
+            
+            // Unsafe Optimization: Avoid memset(0)
+            // We set length to 65535 so we have a mutable slice to write into.
+            // Safety: We must ensure we don't read uninitialized bytes before writing.
+            // tun_rs.recv() will overwrite the buffer content.
+            unsafe { buf.set_len(65535) };
             
             // tun-rs AsyncDevice implements AsyncRead
             match reader_dev.recv(&mut buf).await {
                 Ok(n) => {
                     if n > 0 {
-                         buf.truncate(n);
-                         if os_tx.send(buf).await.is_err() { break; }
+                         // Truncate to actual read size
+                         unsafe { buf.set_len(n) };
+                         
+                         // Zero-Copy: split_to moves the data ownership to os_tx
+                         // The remaining capacity in `buf` is retained for next loop!
+                         let packet = buf.split_to(n);
+                         
+                         if os_tx.send(packet).await.is_err() { break; }
                     }
                 }
                 Err(e) => {
