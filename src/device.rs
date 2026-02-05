@@ -97,93 +97,39 @@ impl<'a> TxToken for TxTokenImpl<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // Optimization: Use Object Pool to avoid malloc
+        // Optimization: Arena Allocation (Slab-like)
         // 1. Try get from pool
         let mut buffer = self.0.tx_pool.pop().unwrap_or_else(|| {
-             // Fallback: Allocate new if pool empty
-             // Use with_capacity to avoid memset
-             BytesMut::with_capacity(len)
+             // Fallback: Allocate a LARGE chunk (64KB) if pool empty
+             // This ensures we have plenty of "sausage" to slice from
+             BytesMut::with_capacity(65535)
         });
 
         // 2. Ensure capacity
+        // If the popped buffer is too small (shouldn't happen with our logic, but safe guard)
         if buffer.capacity() < len {
-             buffer.reserve(len - buffer.capacity());
+             // If existing chunk is too small, just alloc a new big one
+             // The old small one is dropped
+             buffer = BytesMut::with_capacity(65535);
         }
         
         // 3. Set length safely (avoid memset)
+        // We set length to `len` so `f` can write into it.
+        // Safety: `f` (smoltcp) will initialize it.
         unsafe { buffer.set_len(len) };
         
         // 4. Write data
         let result = f(&mut buffer);
         
-        // 5. Zero-Copy Send
-        // Note: buffer.freeze() consumes the BytesMut and returns Bytes.
-        // We cannot return the BytesMut to the pool because it's gone (transformed).
-        // BUT, if the Bytes is dropped elsewhere, the memory is freed.
-        // To truly recycle, we need the Consumer to return the buffer.
-        // Since we are sending to a Channel, we lose control.
-        // However, we can keep the *allocation* if we use `split()` or similar?
-        // No, `freeze` takes ownership.
-        
-        // Wait, if we send `Bytes`, we lose the `BytesMut`.
-        // So this Pool strategy only works if we don't send it, OR if we clone?
-        // Cloning defeats the purpose.
-        
-        // Actually, there is a trick: `BytesMut::split_to` or `freeze` works on the active part.
-        // If we want to reuse the *allocation*, we should probably not use `freeze` if we want to keep `BytesMut`.
-        // But `tx_queue` expects `Bytes`.
-        
-        // If we use `recycler` crate, it handles this via specific types.
-        // But for a simple Vec pool, we can't easily recycle *after* sending to channel unless the receiver sends it back.
-        // Since we can't change the channel signature easily (it's `Sender<Bytes>`), we might be stuck with allocation 
-        // unless we change the architecture to return buffers.
-        
-        // HOWEVER, `BytesMut` does have a trick: `split()`
-        // "Splits the bytes into two ... Retains the capacity in the original."
-        // Let's try:
-        
+        // 5. Zero-Copy Send via Splitting
+        // `split_to(len)` returns a new BytesMut containing [0, len)
+        // `buffer` retains [len, capacity) - effectively the "rest" of the allocation
         let packet = buffer.split_to(len).freeze();
         
-        // Now `packet` (Bytes) owns the data.
-        // `buffer` (BytesMut) retains the remaining capacity (if any) or is empty but might keep allocation?
-        // Actually, `split_to` moves the pointer. The *head* is moved.
-        // If we split *everything*, `buffer` becomes empty. Does it keep capacity?
-        // Docs: "The returned BytesMut will have the same capacity as the original... NO."
-        // Docs: "Splits the buffer into two at the given index. Afterwards self contains elements [at, len), and the returned BytesMut contains elements [0, at)."
-        // We want to send [0, len). So we call split_to(len).
-        // Then `buffer` contains [len, capacity).
-        // If capacity was exactly len, buffer is empty.
-        
-        // So to reuse capacity, we should allocate *larger* chunks (Arena style)?
-        // Or, we just accept that we can't easily recycle `BytesMut` if we give it away as `Bytes`.
-        
-        // REVISION: The user suggested "recycler" crate or "simple Vec<BytesMut>".
-        // With simple Vec<BytesMut>, if we give away the BytesMut (via freeze), we can't put it back.
-        // Unless we don't give it away?
-        // But we MUST send it to `tx_queue`.
-        
-        // The only way to recycle is if the `Bytes` we send is a *copy* (slow) OR if we have a mechanism to get it back.
-        // Since we want Zero-Copy, we must send the underlying memory.
-        
-        // WAIT! `BytesMut` allows multiple handles to the same memory?
-        // No, `Bytes` is ref-counted.
-        
-        // Let's look at `recycler` crate pattern if we were to use it.
-        // But for now, let's implement the "Arena" pattern with `split_to`.
-        // If we allocate 64KB, and send 1500B.
-        // `split_to(1500)` returns a new BytesMut with the data.
-        // `buffer` keeps the rest (64000B).
-        // We can put `buffer` back in the pool!
-        // This works for "fragmentation" recycling.
-        
-        // Let's implement this "Arena" strategy.
-        // Allocate 64KB chunks. Slice off packets.
-        // When buffer is too small, drop it and allocate new 64KB.
-        
-        if buffer.capacity() < 2048 { // If too small to be useful
-             // Drop it (let it free)
-             // Create new big chunk next time
-        } else {
+        // 6. Recycle remaining capacity
+        // Only put back if it has enough space for another typical packet (e.g. > 2KB)
+        // If it's too small (fragmented), we drop it, and next time we alloc a new 64KB chunk.
+        if buffer.capacity() > 2048 {
              self.0.tx_pool.push(buffer);
         }
         
