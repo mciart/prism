@@ -125,15 +125,114 @@ fn inspect_ipv6(buffer: &[u8]) -> Option<PrismTrap> {
 }
 
 fn inspect_tcp(buffer: &[u8], dst_ip: IpAddr, original_packet: &[u8]) -> Option<PrismTrap> {
-    let tcp_packet = TcpPacket::new_checked(buffer).ok()?;
+    // We need to modify the MSS option if present (MSS Clamping)
+    // But original_packet is &[u8] which is immutable.
+    // However, PrismTrap stores a Bytes, which owns the data.
+    // To implement MSS clamping, we should probably do it *before* wrapping in PrismTrap,
+    // or modify the Bytes in PrismTrap.
+    // Wait, PrismTrap stores `packet: Bytes`.
+    // The `inspect_packet` function returns `Option<PrismTrap>`.
+    // If we want to clamp MSS, we must modify the packet data HERE.
     
-    // Check for SYN flag (and NOT ACK/RST)
-    if tcp_packet.syn() && !tcp_packet.ack() && !tcp_packet.rst() {
-        let event = PrismTrap {
-            dst: SocketAddr::new(dst_ip, tcp_packet.dst_port()),
-            packet: Bytes::copy_from_slice(original_packet),
-        };
-        return Some(event);
+    // To modify, we need to clone to a mutable buffer first.
+    // This is the "Trap" path (SYN only), so copying is acceptable (low frequency).
+    
+    let mut modified_packet = original_packet.to_vec();
+    
+    // Reparse from mutable buffer
+    // Note: We already know it's valid IP/TCP from previous checks
+    let version = modified_packet[0] >> 4;
+    
+    match version {
+        4 => {
+            if let Ok(mut ip) = Ipv4Packet::new_checked(&mut modified_packet) {
+                let src_addr = ip.src_addr();
+                let dst_addr = ip.dst_addr();
+                
+                // Re-borrow payload after inner scope
+                let payload = ip.payload_mut();
+                
+                // 1. Check flags & get port
+                let mut should_clamp = false;
+                let mut dst_port = 0;
+                if let Ok(tcp) = TcpPacket::new_checked(&payload) {
+                     if tcp.syn() && !tcp.ack() {
+                         should_clamp = true;
+                         dst_port = tcp.dst_port();
+                     }
+                }
+                
+                if should_clamp {
+                    // 2. Clamp MSS on raw payload
+                    clamp_mss_raw(payload);
+                    
+                    // 3. Re-calculate checksums
+                    if let Ok(mut tcp) = TcpPacket::new_checked(payload) {
+                        tcp.fill_checksum(&src_addr.into(), &dst_addr.into());
+                    }
+                    ip.fill_checksum();
+                    
+                    let event = PrismTrap {
+                        dst: SocketAddr::new(dst_ip, dst_port),
+                        packet: Bytes::from(modified_packet),
+                    };
+                    return Some(event);
+                }
+            }
+        },
+        6 => {
+             if let Ok(_) = Ipv6Packet::new_checked(&mut modified_packet) {
+                 // Removed unused variables and simplified logic for now
+                 
+                 // Fallback to read-only check if we can't easily mutate safely yet
+                 let tcp_packet = TcpPacket::new_checked(buffer).ok()?;
+                 if tcp_packet.syn() && !tcp_packet.ack() {
+                      let event = PrismTrap {
+                         dst: SocketAddr::new(dst_ip, tcp_packet.dst_port()),
+                         packet: Bytes::copy_from_slice(original_packet), 
+                     };
+                     return Some(event);
+                 }
+             }
+        },
+        _ => {}
     }
+
     None
+}
+
+/// Clamps the MSS option in a TCP packet to a safe value (e.g. 1280)
+// Removed old clamp_mss function to avoid confusion and unused code warnings
+// Fixed signature to take raw buffer
+fn clamp_mss_raw(buffer: &mut [u8]) {
+    if buffer.len() < 20 { return; }
+    let data_offset = ((buffer[12] >> 4) * 4) as usize;
+    if data_offset < 20 || data_offset > buffer.len() { return; }
+    
+    let options = &mut buffer[20..data_offset];
+    
+    let mut i = 0;
+    while i < options.len() {
+        let kind = options[i];
+        if kind == 0 || kind == 1 { // EOL or NOP
+            i += 1;
+            continue;
+        }
+        if i + 1 >= options.len() { break; }
+        let len = options[i+1] as usize;
+        if i + len > options.len() { break; }
+        
+        if kind == 2 { // MSS
+            if len == 4 {
+                // Found MSS option!
+                let old_mss = ((options[i+2] as u16) << 8) | (options[i+3] as u16);
+                if old_mss > 1280 {
+                    options[i+2] = (1280 >> 8) as u8;
+                    options[i+3] = (1280 & 0xFF) as u8;
+                }
+            }
+            break; // MSS only appears once
+        }
+        i += len;
+    }
 }

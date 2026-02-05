@@ -317,6 +317,15 @@ impl PrismStack {
             tcp::SocketBuffer::new(vec![0; tx_buf_size])
         );
         socket.set_keep_alive(Some(Duration::from_secs(60).into()));
+        
+        // Phase 5 Step 2: Configure socket for Jumbo Frames
+        // Allow Nagle's algorithm to be disabled (optional, but good for latency)
+        socket.set_nagle_enabled(false); 
+        
+        // Critical for GSO: Set a very large MSS to prevent smoltcp from fragmenting
+        // This relies on the fact that our underlying device (PrismDevice) claims a large MTU (65535)
+        // smoltcp will calculate MSS based on MTU.
+        // However, we can hint it here if needed, but usually it derives from Interface MTU.
 
          // Register IP to Interface
         match event.dst {

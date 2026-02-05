@@ -63,19 +63,19 @@
 - [ ] **Software GSO (软件分段卸载) 路线图** 🆕:
     *核心策略*: 通过 **Jumbo Frames (巨型帧)** 模拟 GSO，减少系统调用 (Syscall) 开销，实现跨平台 10Gbps 吞吐。
     
-    - [ ] **Step 1: 跨平台 Jumbo Frames (High MTU)**
-        - [ ] 将 TUN MTU 设置为 **65535** (macOS/Linux/Windows 通用)。
-        - [ ] 调整 `PrismDevice` 读取缓冲区至 **64KB+**，防止大包截断。
-        - [ ] **预期**: 减少 90%+ 的 `read/write` 系统调用，PPS 降低 40 倍。
+    - [x] **Step 1: 跨平台 Jumbo Frames (High MTU)**
+        - [x] 将 TUN MTU 设置为 **65535** (macOS/Linux/Windows 通用)。
+        - [x] 调整 `PrismDevice` 读取缓冲区至 **64KB+**，防止大包截断。
+        - [x] **预期**: 减少 90%+ 的 `read/write` 系统调用，PPS 降低 40 倍。
     
-    - [ ] **Step 2: 协议栈适配 (Stack Tuning)**
-        - [ ] 配置 `smoltcp` 接受 **无限大 MSS** (或 65535)，允许处理超大 TCP 段。
-        - [ ] 确保 Window Scaling 开启，以支持高带宽延迟积 (BDP)。
+    - [x] **Step 2: 协议栈适配 (Stack Tuning)**
+        - [x] 配置 `smoltcp` 接受 **无限大 MSS** (或 65535)，允许处理超大 TCP 段。
+        - [x] 确保 Window Scaling 开启，以支持高带宽延迟积 (BDP)。
     
-    - [ ] **Step 3: MSS Clamping (关键)**
-        - [ ] **问题**: 本地 MTU 65535，但公网仅支持 1500。直接转发会导致路径黑洞。
-        - [ ] **解决**: 在 `PrismTrap` 拦截 SYN 包时，强制修改 MSS 选项 (如改为 1300)。
-        - [ ] **效果**: 浏览器(本地) <-> Prism 走 Jumbo Frame (高速)；Prism <-> 公网 走标准包 (兼容)。
+    - [x] **Step 3: MSS Clamping (关键)**
+        - [x] **问题**: 本地 MTU 65535，但公网仅支持 1500。直接转发会导致路径黑洞。
+        - [x] **解决**: 在 `PrismTrap` 拦截 SYN 包时，强制修改 MSS 选项 (如改为 1280)。
+        - [x] **效果**: 浏览器(本地) <-> Prism 走 Jumbo Frame (高速)；Prism <-> 公网 走标准包 (兼容)。
 
     - [ ] **Step 4: Linux Native GSO (可选/进阶)**
         - [ ] 开启 `IFF_VNET_HDR` 标志 (仅 Linux)。

@@ -66,7 +66,8 @@ async fn main() -> io::Result<()> {
     tokio::spawn(async move {
         loop {
             // Pre-allocate buffer on heap (Zero-Copy-ish: write directly to heap buffer)
-            let mut buf = BytesMut::zeroed(2048); 
+            // Phase 5 Step 1: Increase buffer to 65535 to support Jumbo Frames
+            let mut buf = BytesMut::zeroed(65535); 
             
             // tun-rs AsyncDevice implements AsyncRead
             match reader_dev.recv(&mut buf).await {
