@@ -1,0 +1,33 @@
+[package]
+name = "prism"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance userspace network stack for Mirage"
+
+[dependencies]
+# Network Core
+smoltcp = { version = "0.11", features = ["std", "medium-ip", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
+tun-rs = { version = "2", features = ["async"] }
+socket2 = "0.5"
+ipnet = "2.9"
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Utils
+bytes = "1.5" # Safe Zero-Copy
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+dashmap = "5.5"
+rand = "0.8"
+
+# Config
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
