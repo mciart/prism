@@ -53,18 +53,34 @@
     - [ ] 对非 IP 流量 (如 ARP) 进行本地响应或广播处理。
 
 ### Phase 5: 深度性能调优 (Advanced Performance) 🟡
-**目标**: 将吞吐量推向物理极限 (1Gbps+)。
+**目标**: 将吞吐量推向物理极限 (1Gbps -> 10Gbps)。
 
-- [x] **Event-Driven Polling**:
-    - [x] 重构 `PrismStack::run`，移除 `sleep(10ms)`。
-    - [x] 引入 `tokio::select!` 监听 TUN/Channel 事件。
-    - [x] 实现 `SelectAll` 用于动态隧道数据聚合 (Fan-in)。
-- [x] **Batch Processing (批量处理)**:
-    - [x] 在 `PrismStack` 中实现 Receive Loop 批量读取 (Max 64 pkts)。
-- [x] **GSO/GRO (分段卸载)**:
-    - [x] 研究结论: macOS `utun` 不支持用户态 GSO/GRO (需 Linux `virtio-net-hdr`)。暂跳过。
-- [x] **Smoltcp 缓冲区调优**:
-    - [x] `TCP_RX_BUFFER_SIZE` / `TCP_TX_BUFFER_SIZE` 调整为 2MB。
+- [x] **基础调优**:
+    - [x] **Event-Driven Polling**: 重构 `PrismStack::run`，引入 `tokio::select!`。
+    - [x] **Batch Processing**: 实现批量读取 (Max 64 pkts)。
+    - [x] **Buffer Tuning**: `smoltcp` 缓冲区调整为 2MB+。
+
+- [ ] **Software GSO (软件分段卸载) 路线图** 🆕:
+    *核心策略*: 通过 **Jumbo Frames (巨型帧)** 模拟 GSO，减少系统调用 (Syscall) 开销，实现跨平台 10Gbps 吞吐。
+    
+    - [ ] **Step 1: 跨平台 Jumbo Frames (High MTU)**
+        - [ ] 将 TUN MTU 设置为 **65535** (macOS/Linux/Windows 通用)。
+        - [ ] 调整 `PrismDevice` 读取缓冲区至 **64KB+**，防止大包截断。
+        - [ ] **预期**: 减少 90%+ 的 `read/write` 系统调用，PPS 降低 40 倍。
+    
+    - [ ] **Step 2: 协议栈适配 (Stack Tuning)**
+        - [ ] 配置 `smoltcp` 接受 **无限大 MSS** (或 65535)，允许处理超大 TCP 段。
+        - [ ] 确保 Window Scaling 开启，以支持高带宽延迟积 (BDP)。
+    
+    - [ ] **Step 3: MSS Clamping (关键)**
+        - [ ] **问题**: 本地 MTU 65535，但公网仅支持 1500。直接转发会导致路径黑洞。
+        - [ ] **解决**: 在 `PrismTrap` 拦截 SYN 包时，强制修改 MSS 选项 (如改为 1300)。
+        - [ ] **效果**: 浏览器(本地) <-> Prism 走 Jumbo Frame (高速)；Prism <-> 公网 走标准包 (兼容)。
+
+    - [ ] **Step 4: Linux Native GSO (可选/进阶)**
+        - [ ] 开启 `IFF_VNET_HDR` 标志 (仅 Linux)。
+        - [ ] 在读写时处理 `virtio_net_hdr` 头部。
+        - [ ] **收益**: 利用内核硬件卸载计算 Checksum，进一步降低 CPU 占用。
 
 ### Phase 6: 协议扩展 (Universal Protocol Support) 🟢
 **核心策略**: **TCP 必须拦截** (为了性能和抗 Meltdown)，**其他协议统一切换为纯盲转发 (Blind Relay)**。
