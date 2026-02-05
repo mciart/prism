@@ -6,14 +6,36 @@ use bytes::{Bytes, BytesMut};
 use prism::stack::{PrismStack, PrismConfig, HandshakeMode};
 use prism::device::PrismDevice;
 use std::sync::Arc;
+use clap::Parser;
+
+/// Prism Echo Server Benchmark Tool
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// MTU (Maximum Transmission Unit)
+    #[arg(long, default_value_t = 1280)]
+    mtu: usize,
+
+    /// Handshake Mode: fast (0-RTT) or consistent (Real RTT)
+    #[arg(long, default_value = "fast")]
+    mode: String,
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Enable logging
     tracing_subscriber::fmt::init();
+    
+    // Parse CLI args
+    let args = Args::parse();
+    let handshake_mode = match args.mode.to_lowercase().as_str() {
+        "consistent" => HandshakeMode::Consistent,
+        _ => HandshakeMode::Fast,
+    };
 
     println!("🚀 Prism Echo Server Benchmark");
     println!("Operating System: {}", std::env::consts::OS);
+    println!("Configuration: MTU={}, Mode={:?}", args.mtu, handshake_mode);
     
     // 1. Create TUN Device
     // User requested 10.11.12.1 to avoid 10.0.0.1 conflict
@@ -27,7 +49,7 @@ async fn main() -> io::Result<()> {
             std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
             64
         )
-        .mtu(1280) // Conservative MTU for mobile networks
+        .mtu(args.mtu as u16) // Conservative MTU for mobile networks
         .packet_information(false); // Critical for macOS to avoid 4-byte header
 
     let dev = builder.build_async().expect("Failed to create TUN");
@@ -75,10 +97,10 @@ async fn main() -> io::Result<()> {
 
     // 3. Create Prism Stack
     let config = PrismConfig {
-        handshake_mode: HandshakeMode::Fast,
+        handshake_mode,
     };
     
-    let device = PrismDevice::new(os_rx, tun_tx.clone(), 1280, Medium::Ip);
+    let device = PrismDevice::new(os_rx, tun_tx.clone(), args.mtu, Medium::Ip);
     let mut stack = PrismStack::new(device, config);
     
     // 4. Setup Tunnel Request Handling AND Blind Relay
