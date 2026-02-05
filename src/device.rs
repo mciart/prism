@@ -90,9 +90,12 @@ impl<'a> TxToken for TxTokenImpl<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
+        // Optimization: Use BytesMut to avoid Vec allocation (malloc)
+        // We use zeroed() to ensure safety (initialized memory), although it has slight overhead.
+        // This allows us to freeze() into Bytes without copying.
+        let mut buffer = BytesMut::zeroed(len);
         let result = f(&mut buffer);
-        let bytes = Bytes::from(buffer);
+        let bytes = buffer.freeze();
         
         if let Err(e) = self.0.tx_queue.try_send(bytes) {
              warn!("TX Queue Full/Closed: {}", e);
