@@ -828,6 +828,7 @@ dependencies = [
  "futures",
  "ipnet",
  "rand",
+ "recycler",
  "serde",
  "smoltcp",
  "socket2 0.5.10",
@@ -908,6 +909,12 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
 ]
+
+[[package]]
+name = "recycler"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98dc27328efeb3250fc4f8b7b79fe34339856513229f19d374ca78aeb10694fa"
 
 [[package]]
 name = "redox_syscall"
