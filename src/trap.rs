@@ -101,7 +101,6 @@ fn inspect_ipv4(buffer: &[u8]) -> Option<PrismTrap> {
         return None;
     }
 
-    let _src_addr = IpAddr::V4(ipv4_packet.src_addr().into());
     let dst_addr = IpAddr::V4(ipv4_packet.dst_addr().into());
     let payload = ipv4_packet.payload();
 
@@ -116,7 +115,6 @@ fn inspect_ipv6(buffer: &[u8]) -> Option<PrismTrap> {
         if proto == IpProtocol::Tcp {
              if offset > buffer.len() { return None; }
              let payload = &buffer[offset..];
-             let _src_addr = IpAddr::V6(ipv6_packet.src_addr().into());
              let dst_addr = IpAddr::V6(ipv6_packet.dst_addr().into());
              return inspect_tcp(payload, dst_addr, buffer);
         }

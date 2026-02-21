@@ -1,7 +1,6 @@
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use tokio::sync::mpsc;
-use crate::trap::PrismTrap;
 use crate::constants::{TX_POOL_CAPACITY, TX_POOL_MAX_SIZE, TX_POOL_RECYCLE_THRESHOLD, TX_ARENA_SIZE};
 use std::collections::VecDeque;
 use tracing::warn;
@@ -12,16 +11,10 @@ use bytes::{Bytes, BytesMut};
 pub struct PrismDevice {
     pub rx_queue: mpsc::Receiver<BytesMut>,
     pub tx_queue: mpsc::Sender<Bytes>,
-    pub trap_tx: Option<mpsc::Sender<PrismTrap>>,
     pub pending_packets: VecDeque<BytesMut>,
     pub mtu: usize,
     pub medium: Medium,
-    // Simple Object Pool for TX buffers
-    // We use Vec<BytesMut> as a stack.
-    // Ideally we would use crossbeam::SegQueue or deadpool for lock-free, but Mutex is fine for now as it's single-threaded context mostly.
-    // Actually, PrismDevice is accessed via &mut, so we don't even need Arc<Mutex> if we own it?
-    // But TxToken needs to access it. TxToken holds &'a mut PrismDevice.
-    pub tx_pool: Vec<BytesMut>, 
+    pub tx_pool: Vec<BytesMut>,
 }
 
 impl PrismDevice {
@@ -34,16 +27,11 @@ impl PrismDevice {
         Self {
             rx_queue,
             tx_queue,
-            trap_tx: None,
             pending_packets: VecDeque::new(),
             mtu,
             medium,
             tx_pool: Vec::with_capacity(TX_POOL_CAPACITY),
         }
-    }
-    
-    pub fn set_trap_sender(&mut self, tx: mpsc::Sender<PrismTrap>) {
-        self.trap_tx = Some(tx);
     }
 }
 

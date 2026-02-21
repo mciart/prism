@@ -8,7 +8,7 @@ use rand::Rng;
 use crate::device::PrismDevice;
 use crate::trap::PrismTrap;
 use crate::constants::{TCP_RX_BUFFER_SIZE, TCP_TX_BUFFER_SIZE, BATCH_SIZE};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use tracing::{debug, warn, error};
 use smoltcp::phy::Device;
@@ -79,6 +79,10 @@ pub struct PrismStack {
     pub config: PrismConfig,
     /// Pending SYNs waiting for tunnel confirmation (Consistent Mode)
     pub pending_syns: HashMap<SocketAddr, (PrismTrap, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)>,
+    /// Tracks which IPs are registered for each socket handle (for cleanup on close)
+    pub active_ips: HashMap<SocketHandle, IpCidr>,
+    /// Set of all dynamically-registered IP CIDRs (to prevent re-adding)
+    pub registered_ips: HashSet<IpCidr>,
     /// Internal feedback channel to receive signals from the async bridge tasks
     pub feedback_tx: mpsc::Sender<(SocketAddr, bool)>,
     pub feedback_rx: mpsc::Receiver<(SocketAddr, bool)>,
@@ -133,6 +137,8 @@ impl PrismStack {
             device,
             config,
             pending_syns: HashMap::new(),
+            active_ips: HashMap::new(),
+            registered_ips: HashSet::new(),
             feedback_tx,
             feedback_rx,
         }
@@ -319,6 +325,15 @@ impl PrismStack {
                 // Drop the tx sender — this causes the remote rx to close,
                 // which in turn ends the BoxStream in ingress_streams (SelectAll auto-removes ended streams).
                 self.active_tunnels.remove(&handle);
+                
+                // Clean up dynamically-registered IP address to prevent ip_addrs table leak
+                if let Some(cidr) = self.active_ips.remove(&handle) {
+                    self.registered_ips.remove(&cidr);
+                    self.iface.update_ip_addrs(|ip_addrs| {
+                        ip_addrs.retain(|addr| *addr != cidr);
+                    });
+                }
+                
                 self.sockets.remove(handle);
             }
         }
@@ -330,41 +345,35 @@ impl PrismStack {
     fn handle_trap(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, rx_buf_size: usize, tx_buf_size: usize) {
         debug!("Trapped SYN for target: {}", event.dst);
 
-         // Register IP to Interface (needed for both modes)
-        match event.dst {
+        // Register IP to Interface (needed for both modes)
+        let cidr = match event.dst {
             std::net::SocketAddr::V4(addr) => {
                 let endpoint_ip = Ipv4Address::from_bytes(&addr.ip().octets());
-                self.iface.update_ip_addrs(|ip_addrs| {
-                    let cidr = IpCidr::new(IpAddress::Ipv4(endpoint_ip), 32);
-                    if !ip_addrs.contains(&cidr) {
-                         let _ = ip_addrs.push(cidr);
-                    }
-                });
+                IpCidr::new(IpAddress::Ipv4(endpoint_ip), 32)
             },
             std::net::SocketAddr::V6(addr) => {
-                 debug!("handle_trap: Handling IPv6 target: {}", addr);
-                 let endpoint_ip = Ipv6Address::from_bytes(&addr.ip().octets());
-                 self.iface.update_ip_addrs(|ip_addrs| {
-                    let cidr = IpCidr::new(IpAddress::Ipv6(endpoint_ip), 128);
-                    if !ip_addrs.contains(&cidr) {
-                         debug!("handle_trap: Registering new IPv6 addr: {}", cidr);
-                         let _ = ip_addrs.push(cidr);
-                    }
-                });
+                let endpoint_ip = Ipv6Address::from_bytes(&addr.ip().octets());
+                IpCidr::new(IpAddress::Ipv6(endpoint_ip), 128)
             }
+        };
+
+        if !self.registered_ips.contains(&cidr) {
+            self.iface.update_ip_addrs(|ip_addrs| {
+                let _ = ip_addrs.push(cidr);
+            });
+            self.registered_ips.insert(cidr);
         }
 
         // Dispatch to handshake mode
         if self.config.handshake_mode == HandshakeMode::Consistent {
             self.initiate_consistent_handshake(event, pkt);
         } else {
-            self.initiate_fast_handshake(event, pkt, rx_buf_size, tx_buf_size);
+            self.initiate_fast_handshake(event, pkt, rx_buf_size, tx_buf_size, cidr);
         }
     }
 
     fn initiate_consistent_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut) {
-        // Bug Fix: Guard against SYN retransmits creating duplicate tunnel requests.
-        // If we already have a pending SYN for this target, just drop the retransmit.
+        // Guard against SYN retransmits creating duplicate tunnel requests.
         if self.pending_syns.contains_key(&event.dst) {
             debug!("Consistent Handshake: Ignoring SYN retransmit for {}", event.dst);
             return;
@@ -399,8 +408,8 @@ impl PrismStack {
                           resp_rx,
                       ).await {
                           Ok(Ok(val)) => val,
-                          Ok(Err(_)) => false,   // Sender dropped
-                          Err(_) => {             // Timeout
+                          Ok(Err(_)) => false,
+                          Err(_) => {
                               tracing::warn!("Consistent Handshake timeout for {}", target);
                               false
                           }
@@ -411,77 +420,76 @@ impl PrismStack {
         }
     }
 
-    fn initiate_fast_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, rx_buf_size: usize, tx_buf_size: usize) {
-    // Create socket here (not in handle_trap) to avoid wasting 4MB in Consistent mode
-    let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; rx_buf_size]),
-        tcp::SocketBuffer::new(vec![0; tx_buf_size])
-    );
-    socket.set_keep_alive(Some(Duration::from_secs(60).into()));
-    socket.set_nagle_enabled(false);
+    fn initiate_fast_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, rx_buf_size: usize, tx_buf_size: usize, cidr: IpCidr) {
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; rx_buf_size]),
+            tcp::SocketBuffer::new(vec![0; tx_buf_size]),
+        );
+        socket.set_keep_alive(Some(Duration::from_secs(60).into()));
+        socket.set_nagle_enabled(false);
 
-    let endpoint = match event.dst {
-        std::net::SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::new(
-             smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(&addr.ip().octets())),
-             addr.port(),
-        ),
-        std::net::SocketAddr::V6(addr) => smoltcp::wire::IpEndpoint::new(
-             smoltcp::wire::IpAddress::Ipv6(Ipv6Address::from_bytes(&addr.ip().octets())),
-             addr.port(),
-        ),
-    };
-
-    if let Err(e) = socket.listen(endpoint) {
-        warn!("Failed to listen: {}", e);
-        return;
-    }
-    
-    let handle = self.sockets.add(socket);
-    self.device.pending_packets.push_back(pkt); // Re-inject SYN
-
-    if let Some(ref req_tx) = self.tunnel_req_tx {
-        let (tx_to_remote, rx_from_internal) = mpsc::channel::<Bytes>(1024);
-        let (tx_to_internal, rx_from_remote) = mpsc::channel::<Bytes>(1024);
-        
-        let request = TunnelRequest {
-            target: event.dst,
-            tx: tx_to_internal,
-            rx: rx_from_internal,
-            response_tx: None,
+        let endpoint = match event.dst {
+            std::net::SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(&addr.ip().octets())),
+                addr.port(),
+            ),
+            std::net::SocketAddr::V6(addr) => smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv6(Ipv6Address::from_bytes(&addr.ip().octets())),
+                addr.port(),
+            ),
         };
 
-        if let Err(_) = req_tx.try_send(request) {
-            self.sockets.remove(handle);
-        } else {
-            // Add to active tunnels
-            self.active_tunnels.insert(handle, tx_to_remote);
-            // Add RX stream to SelectAll (Fan-in)
-            self.ingress_streams.push(
-                ReceiverStream::new(rx_from_remote).map(move |b| (handle, b)).boxed()
-            );
+        if let Err(e) = socket.listen(endpoint) {
+            warn!("Failed to listen: {}", e);
+            return;
+        }
+
+        let handle = self.sockets.add(socket);
+        self.device.pending_packets.push_back(pkt);
+        self.active_ips.insert(handle, cidr);
+
+        if let Some(ref req_tx) = self.tunnel_req_tx {
+            let (tx_to_remote, rx_from_internal) = mpsc::channel::<Bytes>(1024);
+            let (tx_to_internal, rx_from_remote) = mpsc::channel::<Bytes>(1024);
+
+            let request = TunnelRequest {
+                target: event.dst,
+                tx: tx_to_internal,
+                rx: rx_from_internal,
+                response_tx: None,
+            };
+
+            if let Err(_) = req_tx.try_send(request) {
+                self.active_ips.remove(&handle);
+                self.sockets.remove(handle);
+            } else {
+                self.active_tunnels.insert(handle, tx_to_remote);
+                self.ingress_streams.push(
+                    ReceiverStream::new(rx_from_remote).map(move |b| (handle, b)).boxed(),
+                );
+            }
         }
     }
-}
 
     fn handle_handshake_feedback(&mut self, target: SocketAddr, success: bool, rx_buf: usize, tx_buf: usize) {
         if let Some((trap, tx_to_remote, rx_from_remote)) = self.pending_syns.remove(&target) {
             if success {
                 debug!("Tunnel ready for {}. Releasing SYN.", target);
-                // Re-create socket logic similar to Fast Mode
-                 let mut socket = tcp::Socket::new(
+                let mut socket = tcp::Socket::new(
                     tcp::SocketBuffer::new(vec![0; rx_buf]),
-                    tcp::SocketBuffer::new(vec![0; tx_buf])
+                    tcp::SocketBuffer::new(vec![0; tx_buf]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(60).into()));
-                
+                socket.set_nagle_enabled(false);
+
                 let endpoint = match target {
                     std::net::SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::new(
-                         smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(&addr.ip().octets())),
-                         addr.port(),
+                        smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(&addr.ip().octets())),
+                        addr.port(),
                     ),
                     std::net::SocketAddr::V6(addr) => smoltcp::wire::IpEndpoint::new(
-                         smoltcp::wire::IpAddress::Ipv6(Ipv6Address::from_bytes(&addr.ip().octets())),
-                         addr.port(),
+                        smoltcp::wire::IpAddress::Ipv6(Ipv6Address::from_bytes(&addr.ip().octets())),
+                        addr.port(),
                     ),
                 };
 
@@ -489,9 +497,21 @@ impl PrismStack {
                     let handle = self.sockets.add(socket);
                     self.active_tunnels.insert(handle, tx_to_remote);
                     self.ingress_streams.push(
-                        ReceiverStream::new(rx_from_remote).map(move |b| (handle, b)).boxed()
+                        ReceiverStream::new(rx_from_remote).map(move |b| (handle, b)).boxed(),
                     );
-                    self.device.pending_packets.push_back(BytesMut::from(trap.packet.as_ref()));  // Note: copy needed since Bytes->BytesMut requires it
+                    // Track IP for cleanup
+                    let cidr = match target {
+                        std::net::SocketAddr::V4(addr) => IpCidr::new(
+                            IpAddress::Ipv4(Ipv4Address::from_bytes(&addr.ip().octets())),
+                            32,
+                        ),
+                        std::net::SocketAddr::V6(addr) => IpCidr::new(
+                            IpAddress::Ipv6(Ipv6Address::from_bytes(&addr.ip().octets())),
+                            128,
+                        ),
+                    };
+                    self.active_ips.insert(handle, cidr);
+                    self.device.pending_packets.push_back(BytesMut::from(trap.packet.as_ref()));
                 }
             } else {
                 warn!("Tunnel failed for {}. Dropping SYN.", target);
