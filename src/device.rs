@@ -2,6 +2,7 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use tokio::sync::mpsc;
 use crate::trap::PrismTrap;
+use crate::constants::{TX_POOL_CAPACITY, TX_POOL_MAX_SIZE, TX_POOL_RECYCLE_THRESHOLD, TX_ARENA_SIZE};
 use std::collections::VecDeque;
 use tracing::warn;
 use bytes::{Bytes, BytesMut};
@@ -37,7 +38,7 @@ impl PrismDevice {
             pending_packets: VecDeque::new(),
             mtu,
             medium,
-            tx_pool: Vec::with_capacity(64), // Pre-allocate pool
+            tx_pool: Vec::with_capacity(TX_POOL_CAPACITY),
         }
     }
     
@@ -100,17 +101,13 @@ impl<'a> TxToken for TxTokenImpl<'a> {
         // Optimization: Arena Allocation (Slab-like)
         // 1. Try get from pool
         let mut buffer = self.0.tx_pool.pop().unwrap_or_else(|| {
-             // Fallback: Allocate a LARGE chunk (64KB) if pool empty
-             // This ensures we have plenty of "sausage" to slice from
-             BytesMut::with_capacity(65535)
+             BytesMut::with_capacity(TX_ARENA_SIZE)
         });
 
         // 2. Ensure capacity
         // If the popped buffer is too small (shouldn't happen with our logic, but safe guard)
         if buffer.capacity() < len {
-             // If existing chunk is too small, just alloc a new big one
-             // The old small one is dropped
-             buffer = BytesMut::with_capacity(65535);
+             buffer = BytesMut::with_capacity(TX_ARENA_SIZE);
         }
         
         // 3. Set length safely (avoid memset)
@@ -127,9 +124,8 @@ impl<'a> TxToken for TxTokenImpl<'a> {
         let packet = buffer.split_to(len).freeze();
         
         // 6. Recycle remaining capacity
-        // Only put back if it has enough space for another typical packet (e.g. > 2KB)
-        // If it's too small (fragmented), we drop it, and next time we alloc a new 64KB chunk.
-        if buffer.capacity() > 2048 {
+        // Recycle if has enough space AND pool isn't full (prevent OOM)
+        if buffer.capacity() > TX_POOL_RECYCLE_THRESHOLD && self.0.tx_pool.len() < TX_POOL_MAX_SIZE {
              self.0.tx_pool.push(buffer);
         }
         

@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use rand::Rng;
 use crate::device::PrismDevice;
 use crate::trap::PrismTrap;
+use crate::constants::{TCP_RX_BUFFER_SIZE, TCP_TX_BUFFER_SIZE, BATCH_SIZE};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, warn, error};
@@ -26,6 +27,15 @@ pub struct PrismConfig {
 pub enum HandshakeMode {
     Fast,
     Consistent,
+}
+
+impl Default for PrismConfig {
+    fn default() -> Self {
+        Self {
+            handshake_mode: HandshakeMode::Fast,
+            egress_mtu: 1280,
+        }
+    }
 }
 
 /// Request to create a tunnel to a remote target.
@@ -137,10 +147,6 @@ impl PrismStack {
     pub async fn run(mut self) -> anyhow::Result<()> {
         debug!("Prism Stack started (Event-Driven Mode).");
 
-        // Buffer size tuning for 1Gbps+ throughput (2MB+)
-        const TCP_RX_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-        const TCP_TX_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-
         loop {
             let now = Instant::now();
             
@@ -216,7 +222,7 @@ impl PrismStack {
                             }
                             
                             count += 1;
-                            if count >= 64 { break; }
+                            if count >= BATCH_SIZE { break; }
                             
                             // Try get next without waiting
                             match self.device.rx_queue.try_recv() {
@@ -233,7 +239,7 @@ impl PrismStack {
                 // Event B: Data from Active Tunnels (Fan-in)
                 Some((handle, data)) = self.ingress_streams.next() => {
                     let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                    if true { // Simplified scope block for consistency
+                    {
                         if socket.can_send() {
                             // Write to socket TX buffer (Simulated RX from network perspective)
                             // Wait, socket.send_slice() writes to the socket's TX buffer?
@@ -247,7 +253,7 @@ impl PrismStack {
                                 warn!("Socket buffer full (Handle {:?}), dropped {} bytes", handle, data.len() - sent);
                             }
                         }
-                    } // End if true block
+                    }
                 },
 
                 // Event C: Feedback from Consistent Handshake
@@ -307,12 +313,10 @@ impl PrismStack {
             }
             
             for handle in sockets_to_remove {
+                // Drop the tx sender — this causes the remote rx to close,
+                // which in turn ends the BoxStream in ingress_streams (SelectAll auto-removes ended streams).
                 self.active_tunnels.remove(&handle);
                 self.sockets.remove(handle);
-                // Note: The corresponding ingress_stream will naturally end if we drop the socket?
-                // No, the stream is driven by the channel from Relayer.
-                // If we remove the socket, the stream might still produce data.
-                // Our `ingress_streams.next()` check `self.sockets.get_mut` handles this gracefully (if None, ignore).
             }
         }
         
@@ -498,7 +502,7 @@ impl PrismStack {
                     self.ingress_streams.push(
                         ReceiverStream::new(rx_from_remote).map(move |b| (handle, b)).boxed()
                     );
-                    self.device.pending_packets.push_back(BytesMut::from(trap.packet.as_ref()));
+                    self.device.pending_packets.push_back(BytesMut::from(trap.packet.as_ref()));  // Note: copy needed since Bytes->BytesMut requires it
                 }
             } else {
                 warn!("Tunnel failed for {}. Dropping SYN.", target);

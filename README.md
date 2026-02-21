@@ -92,6 +92,8 @@ Prism 提供了灵活的配置体系，分为 **运行时配置**、**启动参�
 | `TCP_TX_BUFFER_SIZE` | 2MB | 单个 TCP 连接的发送缓冲区。 |
 | `BATCH_SIZE` | 64 | epoll/kqueue 每次唤醒最大处理包数，用于减少上下文切换。 |
 | `CHANNEL_SIZE` | 8192 | 内部 mpsc 通道的队列深度。 |
+| `TX_POOL_MAX_SIZE` | 128 | TX 缓冲池最大容量，防止极端负载下内存无限增长。 |
+| `DEFAULT_MSS_CLAMP` | 1280 | 出口路径 MSS 钳制默认值，确保公网兼容性。 |
 
 ## 🎯 适用场景 (Use Cases)
 
