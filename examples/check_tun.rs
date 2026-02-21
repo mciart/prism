@@ -25,6 +25,10 @@ struct Args {
     /// Handshake Mode: fast (0-RTT) or consistent (Real RTT)
     #[arg(long, default_value = "fast")]
     mode: String,
+
+    /// Enable Linux Native GSO/GRO offload (Linux only, ignored on other platforms).
+    #[arg(long, default_value_t = false)]
+    offload: bool,
 }
 
 #[tokio::main]
@@ -41,7 +45,7 @@ async fn main() -> io::Result<()> {
 
     println!("🚀 Prism Echo Server Benchmark");
     println!("Operating System: {}", std::env::consts::OS);
-    println!("Configuration: TUN MTU={}, Egress MTU={}, Mode={:?}", args.mtu, args.egress_mtu, handshake_mode);
+    println!("Configuration: TUN MTU={}, Egress MTU={}, Mode={:?}, Offload={}", args.mtu, args.egress_mtu, handshake_mode, args.offload);
     
     // 1. Create TUN Device
     // User requested 10.11.12.1 to avoid 10.0.0.1 conflict
@@ -58,6 +62,14 @@ async fn main() -> io::Result<()> {
         .mtu(args.mtu as u16) // Conservative MTU for mobile networks
         .packet_information(false); // Critical for macOS to avoid 4-byte header
 
+    // Apply Linux-specific offload if requested
+    #[cfg(target_os = "linux")]
+    let builder = if args.offload {
+        builder.offload(true)
+    } else {
+        builder
+    };
+
     let dev = builder.build_async().expect("Failed to create TUN");
     println!("✅ TUN Device Created: {} (IP: 10.11.12.1, IPv6: fd00::1)", dev.name().unwrap_or("unknown".to_string()));
     let dev = Arc::new(dev); // Wrap in Arc for shared access
@@ -69,33 +81,33 @@ async fn main() -> io::Result<()> {
     // Spawn Bridge Tasks
     // Reader Task
     let reader_dev = dev.clone();
+    let reader_offload = args.offload;
     tokio::spawn(async move {
         // Optimization A: Buffer Reuse (Smart Batching)
-        // Allocate a large buffer (1MB) once to reduce malloc overhead
         let mut buf = BytesMut::with_capacity(1024 * 1024);
         
+        // Extra space for virtio_net_hdr when offload is enabled
+        let extra_hdr = if reader_offload { prism::constants::VIRTIO_NET_HDR_SIZE } else { 0 };
+        
         loop {
-            // Ensure capacity for next Jumbo Frame
-            if buf.capacity() < 65535 {
-                buf.reserve(65535);
+            if buf.capacity() < 65535 + extra_hdr {
+                buf.reserve(65535 + extra_hdr);
             }
             
-            // Unsafe Optimization: Avoid memset(0)
-            // We set length to 65535 so we have a mutable slice to write into.
-            // Safety: We must ensure we don't read uninitialized bytes before writing.
-            // tun_rs.recv() will overwrite the buffer content.
-            unsafe { buf.set_len(65535) };
+            unsafe { buf.set_len(65535 + extra_hdr) };
             
-            // tun-rs AsyncDevice implements AsyncRead
             match reader_dev.recv(&mut buf).await {
                 Ok(n) => {
                     if n > 0 {
-                         // Truncate to actual read size
                          unsafe { buf.set_len(n) };
                          
-                         // Zero-Copy: split_to moves the data ownership to os_tx
-                         // The remaining capacity in `buf` is retained for next loop!
-                         let packet = buf.split_to(n);
+                         // Linux GSO: Strip virtio_net_hdr before passing to stack
+                         let packet = if reader_offload && n > prism::constants::VIRTIO_NET_HDR_SIZE {
+                             let stripped = buf.split_to(n);
+                             BytesMut::from(&stripped[prism::constants::VIRTIO_NET_HDR_SIZE..])
+                         } else {
+                             buf.split_to(n)
+                         };
                          
                          if os_tx.send(packet).await.is_err() { break; }
                     }
@@ -110,10 +122,23 @@ async fn main() -> io::Result<()> {
 
     // Writer Task
     let writer_dev = dev.clone();
+    let writer_offload = args.offload;
     tokio::spawn(async move {
         while let Some(pkt) = tun_rx.recv().await {
-            // tun-rs AsyncDevice implements AsyncWrite or send
-            if let Err(e) = writer_dev.send(&pkt).await {
+            // Linux GSO: Prepend virtio_net_hdr for TX
+            let to_send: bytes::Bytes = if writer_offload {
+                #[cfg(target_os = "linux")]
+                {
+                    prism::offload::prepend_virtio_hdr_csum(&pkt).freeze()
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    pkt
+                }
+            } else {
+                pkt
+            };
+            if let Err(e) = writer_dev.send(&to_send).await {
                 eprintln!("TUN Write Error: {}", e);
             }
         }
@@ -122,7 +147,8 @@ async fn main() -> io::Result<()> {
     // 3. Create Prism Stack
     let config = PrismConfig {
         handshake_mode,
-        egress_mtu: args.egress_mtu, // Use the dedicated egress MTU parameter
+        egress_mtu: args.egress_mtu,
+        linux_offload: args.offload,
     };
     
     let device = PrismDevice::new(os_rx, tun_tx.clone(), args.mtu, Medium::Ip);

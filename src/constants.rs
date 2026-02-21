@@ -26,3 +26,7 @@ pub const TX_ARENA_SIZE: usize = 65535;
 
 /// Default MSS clamp value for egress path compatibility.
 pub const DEFAULT_MSS_CLAMP: u16 = 1280;
+
+/// Size of the virtio_net_hdr structure (Linux GSO/GRO).
+/// When IFF_VNET_HDR is enabled, the TUN device prepends this header to each packet.
+pub const VIRTIO_NET_HDR_SIZE: usize = 10;

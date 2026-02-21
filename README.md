@@ -16,6 +16,8 @@ Prism (棱镜) 是一个基于 Rust 构建的高性能、异步、用户态网�
 
 - **Software GSO (软件分段卸载)**: 突破 1500 MTU 限制。Prism 采用 Jumbo Frames (MTU 65535) 技术，让操作系统一次性传递 64KB 大包，将系统调用 (Syscall) 开销降低 40 倍，单核即可跑满万兆 (10Gbps) 物理带宽。
 
+- **Linux Native GSO/GRO**: 在 Linux 上可启用 `IFF_VNET_HDR` + `virtio_net_hdr`，利用内核硬件卸载计算 Checksum，进一步降低 CPU 占用。
+
 - **Zero-Copy & Zero-Allocation**: 全链路零拷贝设计。利用 `bytes::Bytes` 和对象池 (Object Pooling) 技术，在 RX/TX 路径上实现了真正的 **零内存分配**，消除了高并发下的 GC 压力和内存抖动。
 
 - **Async Runtime**: 基于 tokio 和 smoltcp 的全异步架构，轻松应对数万并发连接 (C10K+)。
@@ -72,6 +74,7 @@ Prism 提供了灵活的配置体系，分为 **运行时配置**、**启动参�
 | :--- | :--- | :--- | :--- |
 | `egress_mtu` | usize | 1280 | **出口 MTU / 路径 MTU**。<br>决定了 UDP 包的最大限制和 TCP MSS 的计算基准。这是兼容性的核心。<br>推荐值：1280 (绝对安全) 或 1420 (一般宽带)。 |
 | `handshake_mode` | Enum | Fast | **握手模式**。<br>• **Fast**: 0-RTT 抢答，秒开网页，适合浏览器。<br>• **Consistent**: 同步模式，保留真实 RTT，适合游戏和 VoIP。 |
+| `linux_offload` | bool | false | **Linux 原生 GSO** (仅 Linux)。<br>启用 `IFF_VNET_HDR` 进行 Checksum 硬件卸载，其他平台自动忽略。 |
 
 ### 2. 启动参数 (Startup Config)
 
@@ -84,7 +87,7 @@ Prism 提供了灵活的配置体系，分为 **运行时配置**、**启动参�
 
 ### 3. 核心常量 (Internal Constants)
 
-位于 `src/constants.rs` 和 `src/stack.rs`，用于深度性能调优。
+位于 `src/constants.rs`，用于深度性能调优。
 
 | 常量名 | 当前值 | 说明 |
 | :--- | :--- | :--- |
@@ -94,6 +97,7 @@ Prism 提供了灵活的配置体系，分为 **运行时配置**、**启动参�
 | `CHANNEL_SIZE` | 8192 | 内部 mpsc 通道的队列深度。 |
 | `TX_POOL_MAX_SIZE` | 128 | TX 缓冲池最大容量，防止极端负载下内存无限增长。 |
 | `DEFAULT_MSS_CLAMP` | 1280 | 出口路径 MSS 钳制默认值，确保公网兼容性。 |
+| `VIRTIO_NET_HDR_SIZE` | 10 | Linux GSO `virtio_net_hdr` 头部长度 (bytes)。 |
 
 ## 🎯 适用场景 (Use Cases)
 

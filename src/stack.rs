@@ -21,6 +21,8 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct PrismConfig {
     pub handshake_mode: HandshakeMode,
     pub egress_mtu: usize,
+    /// Enable Linux Native GSO/GRO via IFF_VNET_HDR (Linux only, ignored on other platforms).
+    pub linux_offload: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,7 @@ impl Default for PrismConfig {
         Self {
             handshake_mode: HandshakeMode::Fast,
             egress_mtu: 1280,
+            linux_offload: false,
         }
     }
 }
@@ -326,38 +329,8 @@ impl PrismStack {
     // Helper to handle Trap Logic
     fn handle_trap(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, rx_buf_size: usize, tx_buf_size: usize) {
         debug!("Trapped SYN for target: {}", event.dst);
-        
-        let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; rx_buf_size]),
-            tcp::SocketBuffer::new(vec![0; tx_buf_size])
-        );
-        socket.set_keep_alive(Some(Duration::from_secs(60).into()));
-        
-        // Phase 5 Step 2: Configure socket for Jumbo Frames
-        // Allow Nagle's algorithm to be disabled (optional, but good for latency)
-        socket.set_nagle_enabled(false); 
 
-        // Calculate safe MSS (Egress MTU - 80)
-        // 80 bytes = 40 (IPv6) + 20 (TCP) + 20 (Options)
-        let _safe_mss = if self.config.egress_mtu > 80 {
-            self.config.egress_mtu - 80
-        } else {
-            536 // Fallback
-        };
-
-        // smoltcp socket does not have a public API to set_mss directly.
-        // It automatically negotiates MSS based on Interface MTU.
-        // Since interface MTU is 65535, smoltcp defaults to a huge MSS.
-        // Best practice: To fully support this, we should modify trap.rs to inspect_packet 
-        // and return MSS info, or rely on physical NIC fragmentation.
-        // For now, we calculate _safe_mss but keep existing behavior as per instruction.
-        
-        // Critical for GSO: Set a very large MSS to prevent smoltcp from fragmenting
-        // This relies on the fact that our underlying device (PrismDevice) claims a large MTU (65535)
-        // smoltcp will calculate MSS based on MTU.
-        // However, we can hint it here if needed, but usually it derives from Interface MTU.
-
-         // Register IP to Interface
+         // Register IP to Interface (needed for both modes)
         match event.dst {
             std::net::SocketAddr::V4(addr) => {
                 let endpoint_ip = Ipv4Address::from_bytes(&addr.ip().octets());
@@ -367,12 +340,6 @@ impl PrismStack {
                          let _ = ip_addrs.push(cidr);
                     }
                 });
-                
-                if self.config.handshake_mode == HandshakeMode::Consistent {
-                    self.initiate_consistent_handshake(event, pkt);
-                } else {
-                    self.initiate_fast_handshake(event, pkt, socket);
-                }
             },
             std::net::SocketAddr::V6(addr) => {
                  debug!("handle_trap: Handling IPv6 target: {}", addr);
@@ -384,18 +351,25 @@ impl PrismStack {
                          let _ = ip_addrs.push(cidr);
                     }
                 });
-                
-                if self.config.handshake_mode == HandshakeMode::Consistent {
-                    self.initiate_consistent_handshake(event, pkt);
-                } else {
-                    debug!("handle_trap: Intiating Fast Handshake for IPv6");
-                    self.initiate_fast_handshake(event, pkt, socket);
-                }
             }
+        }
+
+        // Dispatch to handshake mode
+        if self.config.handshake_mode == HandshakeMode::Consistent {
+            self.initiate_consistent_handshake(event, pkt);
+        } else {
+            self.initiate_fast_handshake(event, pkt, rx_buf_size, tx_buf_size);
         }
     }
 
     fn initiate_consistent_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut) {
+        // Bug Fix: Guard against SYN retransmits creating duplicate tunnel requests.
+        // If we already have a pending SYN for this target, just drop the retransmit.
+        if self.pending_syns.contains_key(&event.dst) {
+            debug!("Consistent Handshake: Ignoring SYN retransmit for {}", event.dst);
+            return;
+        }
+
         debug!("Consistent Handshake: Buffering SYN for {}", event.dst);
         
         if let Some(ref req_tx) = self.tunnel_req_tx {
@@ -414,23 +388,38 @@ impl PrismStack {
                 error!("Failed to request tunnel (Consistent): {}", e);
             } else {
                  let trap = PrismTrap { dst: event.dst, packet: pkt.freeze() };
-                 // Store pending
                  self.pending_syns.insert(event.dst, (trap, tx_to_remote, rx_from_remote));
                  
-                 // Spawn wait task
+                 // Spawn wait task with timeout to prevent memory leak
                  let feedback_tx = self.feedback_tx.clone();
                  let target = event.dst;
                  tokio::spawn(async move {
-                      let success = resp_rx.await.unwrap_or(false);
+                      let success = match tokio::time::timeout(
+                          Duration::from_secs(30),
+                          resp_rx,
+                      ).await {
+                          Ok(Ok(val)) => val,
+                          Ok(Err(_)) => false,   // Sender dropped
+                          Err(_) => {             // Timeout
+                              tracing::warn!("Consistent Handshake timeout for {}", target);
+                              false
+                          }
+                      };
                       let _ = feedback_tx.send((target, success)).await;
                  });
             }
         }
     }
 
-    fn initiate_fast_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, mut socket: tcp::Socket<'static>) {
-    // Unconditional handling - smoltcp IpEndpoint handles both V4/V6 via IpAddress enum
-    // But we need to convert std::net::SocketAddr to smoltcp::wire::IpEndpoint
+    fn initiate_fast_handshake(&mut self, event: crate::trap::TrapEvent, pkt: BytesMut, rx_buf_size: usize, tx_buf_size: usize) {
+    // Create socket here (not in handle_trap) to avoid wasting 4MB in Consistent mode
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; rx_buf_size]),
+        tcp::SocketBuffer::new(vec![0; tx_buf_size])
+    );
+    socket.set_keep_alive(Some(Duration::from_secs(60).into()));
+    socket.set_nagle_enabled(false);
+
     let endpoint = match event.dst {
         std::net::SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::new(
              smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(&addr.ip().octets())),
